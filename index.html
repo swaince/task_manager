@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/tauri.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>进程管理器 · Process &amp; Port Inspector</title>
+    <style>
+      /* 首屏底色，避免 WebView 加载时闪白 */
+      html,
+      body {
+        margin: 0;
+        background: oklch(0.141 0.005 285.823);
+        color: oklch(0.985 0 0);
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
