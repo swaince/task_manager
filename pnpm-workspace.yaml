@@ -1,2 +1,9 @@
+# pnpm 设置。历史上这些配置放在 package.json 的 "pnpm" 字段里，
+# 现在统一挪到本文件；两个键分别是 pnpm 11 与 pnpm 12 的写法，各自只读自己认识的那个。
+
+# 允许执行安装脚本的依赖（vue-demi 的 postinstall 会按当前 Vue 版本切换入口）
+onlyBuiltDependencies:
+  - vue-demi
+
 allowBuilds:
   vue-demi: true

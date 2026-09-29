@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# 打包交付物（由 scripts/package-windows.ps1 生成）
+artifacts/
+
+# CI 为了命中缓存而放进项目目录的工具链与包管理器缓存
+.toolchain/
+.cargo/
+.pnpm-store/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

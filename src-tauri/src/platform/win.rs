@@ -220,14 +220,31 @@ pub fn reveal_in_file_manager(path: &str) -> ProcResult<()> {
 }
 
 /// 抽取可执行文件图标并缓存为 PNG DataURL。
+///
+/// 提取过程用一把全局锁串行化：`SHGetFileInfoW` 会访问 Shell 的图标缓存，
+/// 多线程并发进入时偶发返回空图标（`GetDIBits` 拿不到像素）。
+/// Tauri 的命令处理器本身就是多线程的，因此这不是"只有测试才会遇到"的问题。
+/// 由于结果按 exe 路径缓存，同一路径最多只走一次临界区，代价可以忽略。
 pub fn icon_data_url(exe: &str) -> Option<String> {
     static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    static EXTRACT_LOCK: Mutex<()> = Mutex::new(());
+
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.get(exe) {
             return cached.clone();
         }
     }
+
+    let _serialized = EXTRACT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 拿到锁后二次确认：等锁期间可能已经有人把同样的图标抽好了。
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(exe) {
+            return cached.clone();
+        }
+    }
+
     let value = extract_icon(exe);
     if let Ok(mut guard) = cache.lock() {
         guard.insert(exe.to_string(), value.clone());
@@ -387,37 +404,79 @@ mod tests {
         }
     }
 
+    /// 一组几乎必然存在的系统可执行文件，用来做图标抽取测试。
+    const ICON_CANDIDATES: [&str; 4] = [
+        r"C:\Windows\System32\notepad.exe",
+        r"C:\Windows\explorer.exe",
+        r"C:\Windows\System32\cmd.exe",
+        r"C:\Windows\System32\mspaint.exe",
+    ];
+
+    fn existing_candidates() -> Vec<&'static str> {
+        ICON_CANDIDATES
+            .iter()
+            .copied()
+            .filter(|path| std::path::Path::new(path).exists())
+            .collect()
+    }
+
     #[test]
-    fn extracts_png_data_url_for_system_executable() {
-        // 取一个几乎必然存在的系统可执行文件。
-        let candidates = [
-            r"C:\Windows\System32\notepad.exe",
-            r"C:\Windows\explorer.exe",
-            r"C:\Windows\System32\cmd.exe",
-        ];
-        let Some(exe) = candidates.iter().find(|path| std::path::Path::new(path).exists()) else {
+    fn extracts_png_data_url_for_system_executables() {
+        let candidates = existing_candidates();
+        if candidates.is_empty() {
             eprintln!("跳过：找不到可用于测试的系统可执行文件");
             return;
-        };
+        }
 
-        let data_url = icon_data_url(exe).unwrap_or_else(|| panic!("未能抽取 {exe} 的图标"));
-        assert!(
-            data_url.starts_with("data:image/png;base64,"),
-            "图标应为 PNG DataURL，实际前缀：{}",
-            &data_url[..data_url.len().min(40)]
-        );
-        assert!(data_url.len() > 200, "PNG 数据看起来太小，可能为空图");
+        for exe in candidates {
+            let data_url = icon_data_url(exe).unwrap_or_else(|| panic!("未能抽取 {exe} 的图标"));
+            assert!(
+                data_url.starts_with("data:image/png;base64,"),
+                "图标应为 PNG DataURL，实际前缀：{}",
+                &data_url[..data_url.len().min(40)]
+            );
+            assert!(
+                data_url.len() > 200,
+                "{exe} 的 PNG 数据看起来太小，可能为空图"
+            );
+        }
     }
 
     #[test]
     fn icon_results_are_cached() {
-        let exe = r"C:\Windows\explorer.exe";
-        if !std::path::Path::new(exe).exists() {
+        let Some(exe) = existing_candidates().first().copied() else {
             return;
-        }
+        };
         let first = icon_data_url(exe);
         let second = icon_data_url(exe);
         assert_eq!(first, second);
+    }
+
+    /// 图标抽取必须在多线程下稳定成功。
+    ///
+    /// 这条测试是为一个真实缺陷加的：`SHGetFileInfoW` 并发进入时会偶发返回空图标，
+    /// 而 Tauri 的命令处理器本身就是多线程的，所以必须串行化提取过程。
+    #[test]
+    fn icon_extraction_is_thread_safe() {
+        let candidates = existing_candidates();
+        if candidates.is_empty() {
+            eprintln!("跳过：找不到可用于测试的系统可执行文件");
+            return;
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let exes: Vec<&'static str> = candidates.clone();
+            handles.push(std::thread::spawn(move || {
+                for exe in exes {
+                    let icon = icon_data_url(exe);
+                    assert!(icon.is_some(), "并发抽取 {exe} 的图标失败");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("图标抽取线程 panic");
+        }
     }
 
     #[test]

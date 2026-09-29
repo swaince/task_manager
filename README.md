@@ -94,6 +94,15 @@ task_manager/
 │  ├─ lib/format.ts              纯格式化函数（字节 / 时长 / 状态…）
 │  └─ types/process.ts           与 Rust `model.rs` 一一对应的类型
 │
+├─ scripts/                      构建 / 发布脚本（CI 与本地共用同一套入口）
+│  ├─ set-version.ps1            把版本号同步写入三处清单
+│  ├─ package-windows.ps1        产出「安装版 + 免安装版」并写 build.env
+│  ├─ ci-build-windows.ps1       CI 构建入口：解析版本 → 工具链 → 编译 → 打包
+│  ├─ ci-publish-packages.ps1    上传到 GitLab 通用软件包仓库
+│  └─ ci-release.ps1             创建/更新 GitLab Release 并挂载资产链接
+│
+├─ .gitlab-ci.yml                tag → vX.Y.Z；main → 滚动 latest
+│
 └─ src-tauri/                    后端（Rust）
    └─ src/
       ├─ commands.rs             Tauri IPC 边界
@@ -144,14 +153,88 @@ CPU 使用率依赖两次采样的差值，因此 `ProcessService::new()` 会在
 ```bash
 pnpm install                  # 安装前端依赖
 pnpm tauri dev                # 开发模式（热更新，打开桌面窗口）
-pnpm tauri build              # 打包安装包（Windows 下产出 NSIS 安装程序）
+pnpm tauri build              # 构建 NSIS 安装包到 src-tauri/target/release/bundle/nsis
 pnpm build                    # 仅构建前端产物到 dist/
 pnpm test                     # 前端单测（端口过滤表达式解析 / 匹配）
 cd src-tauri && cargo test    # 后端单元测试（14 个）
 ```
 
+想要「安装版 + 免安装版」两件交付物，用打包脚本（CI 走的也是这一条路）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Version 1.0.0
+# 产物输出到 artifacts/
+```
+
 > 建议以 **管理员身份** 运行：普通权限下，受保护进程（系统进程、其他用户会话下的进程、
 > 带保护的服务）读不到命令行 / 环境变量，也无法结束。这类进程会在列表里标记为「受保护」。
+
+---
+
+## 版本与 CI
+
+### 版本号规范
+
+版本号由 **git tag** 决定，形如 `v1.0.0`。三处版本字段（`package.json`、
+`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`）由同一个脚本保持同步：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/set-version.ps1 -Version v1.0.0
+```
+
+CI 在 tag 流水线里会自动调用它，把 tag 去掉 `v` 后写进三处；普通分支构建则沿用仓库里的版本。
+
+### 流水线行为
+
+| 触发 | 行为 |
+| --- | --- |
+| 推送 tag `vX.Y.Z` | 构建 → 发布 release **`vX.Y.Z`**，产物版本号取自 tag |
+| 推送到默认分支 `main` | 构建 → 创建/更新滚动 release **`latest`** |
+
+流水线只在 Windows runner 上跑（Tauri 的 Windows 打包必须在 Windows 上完成）；
+两个作业（构建、发布）都用 `powershell -File scripts/...` 调用仓库里的脚本，
+所以**本地可以用完全相同的命令复跑**：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1
+```
+
+### 交付物
+
+每次构建产出两件，文件名统一为 ASCII（`productName` 是中文，直接进文件名会在
+URL、CI 制品路径上带来编码麻烦，所以打包时统一改名）：
+
+| 文件 | 类型 | 说明 |
+| --- | --- | --- |
+| `ProcessManager_<版本>_x64-setup.exe` | 安装版 | NSIS 安装程序，可选「仅当前用户 / 所有用户」，带开始菜单快捷方式与卸载项 |
+| `ProcessManager_<版本>_x64_portable.zip` | 免安装版 | 解压即用，不写注册表、不留卸载项，删除目录即完成卸载；内含 `使用说明.txt` |
+
+外加 `SHA256SUMS.txt`。产物同时进入两个地方：
+
+1. **作业制品**（默认 1 个月过期，仅用于同一条流水线内传递）；
+2. **GitLab 通用软件包仓库**（持久），release 上的下载链接指向这里，
+   地址形如 `$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/process-manager/<版本>/<文件>`。
+
+> 免安装版就是 `tauri build` 直接产出的那个单文件 exe（前端资源已内嵌），
+> 打包脚本只是把它改名、配上说明并压缩。
+>
+> 注意：**私有项目**的通用软件包仓库下载需要登录 —— release 上的链接会要求认证。
+> 想让链接对外匿名可用，需要把项目设为公开，或把产物放到别处（对象存储 / 静态站点）后
+> 修改 `scripts/ci-release.ps1` 里 `assets.links` 的地址。
+
+### Runner 与变量
+
+只需要一个 **Windows runner**。默认使用 GitLab.com 托管 runner
+（`saas-windows-medium-amd64`，需要 Premium/Ultimate）；自建 runner 覆盖变量
+`WINDOWS_RUNNER_TAG` 即可。runner 上没有 Rust / Node 时，构建脚本会先尝试安装
+（rustup + Chocolatey 或官方 zip 兜底），关掉用 `SKIP_TOOLCHAIN=true`。
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `WINDOWS_RUNNER_TAG` | 否 | Windows runner 的 tag，默认 `saas-windows-medium-amd64` |
+| `SKIP_TOOLCHAIN` | 否 | `true` = 不自动安装缺失的 Rust / Node |
+| `BUILD_VERSION` | 否 | 手动指定版本号，优先级低于 tag |
+| `RELEASE_TOKEN` | 否 | **masked** 的项目访问令牌（`write_repository`）。提供后，main 的滚动 tag `latest` 会被移动到最新提交；不提供则只更新 release 内容，tag 停在首次创建的位置 |
 
 ---
 

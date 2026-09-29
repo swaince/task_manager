@@ -1,0 +1,127 @@
+# =============================================================================
+# 进程管理器 · GitLab CI
+#
+# 流水线行为
+#   * 推送到默认分支（main） → 构建 → 创建/更新滚动 release `latest`
+#   * 推送 tag（vX.Y.Z）     → 构建 → 发布 release vX.Y.Z（产物版本号取自 tag）
+#
+# 交付物（两件）
+#   ProcessManager_<版本>_x64-setup.exe        安装版（NSIS）
+#   ProcessManager_<版本>_x64_portable.zip     免安装版（解压即用）
+#
+# Runner 要求
+#   只需要一个 Windows runner。默认用 GitLab.com 托管 runner
+#   （`saas-windows-medium-amd64`，需要 Premium/Ultimate）；
+#   自建 runner 请覆盖 WINDOWS_RUNNER_TAG 为你的 runner tag。
+#   runner 上如果没有 Rust / Node，构建脚本会自动尝试安装
+#   （rustup + Chocolatey/官方 zip）；想关掉用 SKIP_TOOLCHAIN=true。
+#
+# 可覆盖的 CI/CD 变量（设置 → CI/CD → 变量）
+#   WINDOWS_RUNNER_TAG   Windows runner 的 tag
+#   SKIP_TOOLCHAIN       true = 不在构建前安装缺失的 Rust / Node
+#   BUILD_VERSION        手动指定版本号（覆盖仓库中的版本）
+#   RELEASE_TOKEN        （可选，masked）带 write_repository 权限的项目访问令牌；
+#                        提供后，main 的滚动 tag `latest` 会被移动到最新提交
+#
+# 产物分发
+#   构建产物会同时进入两个地方：
+#     1. 作业制品（1 个月过期，仅用于同一条流水线内传递）；
+#     2. GitLab 通用软件包仓库（持久，release 的下载链接指向这里）。
+# =============================================================================
+
+stages:
+  - build
+  - release
+
+variables:
+  # --- 产物命名 -------------------------------------------------------------
+  PACKAGE_NAME: process-manager # 通用软件包仓库里的包名
+  PRODUCT_SLUG: ProcessManager # 交付文件名前缀
+
+  # --- 构建环境 -------------------------------------------------------------
+  WINDOWS_RUNNER_TAG: saas-windows-medium-amd64
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # 内网/离线环境可指向自建 crates 镜像
+  # CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+# 只有默认分支与 tag 才跑流水线，避免每个 feature 分支都触发一次完整 Windows 构建。
+# 需要 MR 流水线的话，把下面 `merge_request_event` 那条改成 when: always。
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: never
+
+default:
+  interruptible: true
+
+# -----------------------------------------------------------------------------
+# 构建：只在 Windows runner 上跑（Tauri 的 Windows 打包必须在 Windows 上完成）
+# -----------------------------------------------------------------------------
+build:windows:
+  stage: build
+  tags:
+    - $WINDOWS_RUNNER_TAG
+  timeout: 3h
+  cache:
+    # 同一个 key 让 main 与 tag 复用同一份缓存。
+    # 如果缓存体积成为负担，把 src-tauri/target 这一行删掉即可（代价是每次全量重编译）。
+    key: tauri-windows
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - src-tauri/target/
+      - .pnpm-store/
+  variables:
+    # pnpm 的 store 放进项目目录，才能被上面的 cache 命中（Windows 路径要统一用正斜杠）
+    PNPM_STORE_DIR: "$CI_PROJECT_DIR/.pnpm-store"
+  script:
+    # 用 Windows PowerShell（powershell.exe，所有 Windows 都自带）而不是 pwsh：
+    # 自建 runner 上不一定装了 PowerShell 7。脚本本身兼容 5.1。
+    - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1
+    - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-publish-packages.ps1
+  artifacts:
+    name: "$PRODUCT_SLUG-$CI_COMMIT_REF_SLUG"
+    paths:
+      - artifacts/
+    reports:
+      # build.env 里的 PACKAGE_VERSION / INSTALLER_FILE / PORTABLE_FILE
+      # 会作为变量传给 release 作业
+      dotenv: artifacts/build.env
+    expire_in: 1 month
+
+# -----------------------------------------------------------------------------
+# 发布：tag → vX.Y.Z
+# -----------------------------------------------------------------------------
+release:tag:
+  stage: release
+  tags:
+    - $WINDOWS_RUNNER_TAG
+  timeout: 30m
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: build:windows
+      artifacts: true
+  script:
+    - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-release.ps1 -Tag "$CI_COMMIT_TAG"
+
+# -----------------------------------------------------------------------------
+# 发布：main → 滚动 latest
+# -----------------------------------------------------------------------------
+release:latest:
+  stage: release
+  tags:
+    - $WINDOWS_RUNNER_TAG
+  timeout: 30m
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  needs:
+    - job: build:windows
+      artifacts: true
+  script:
+    - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-release.ps1 -Tag latest -Name "Latest（main 滚动构建）"
