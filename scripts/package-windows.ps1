@@ -145,9 +145,11 @@ $sums = foreach ($name in @($installerName, $portableName)) {
     $hash = (Get-FileHash -LiteralPath (Join-Path $OutDir $name) -Algorithm SHA256).Hash.ToLower()
     "$hash  $name"
 }
-[System.IO.File]::WriteAllLines(
+# 同样用 LF：sha256sum 的格式规定是 "哈希  文件名"，行尾若带 \r，
+# 在 Linux / macOS / WSL / Git Bash 上 `sha256sum -c` 会把 \r 当成文件名的一部分而校验失败。
+[System.IO.File]::WriteAllText(
     (Join-Path $OutDir 'SHA256SUMS.txt'),
-    $sums,
+    (($sums -join "`n") + "`n"),
     (New-Object System.Text.UTF8Encoding($false))
 )
 
