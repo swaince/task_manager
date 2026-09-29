@@ -11,7 +11,7 @@
       <Slug>_<version>_<arch>-setup.exe       安装版
       <Slug>_<version>_<arch>_portable.zip    免安装版（解压即用）
       SHA256SUMS.txt                          两个产物的校验和
-      build.env                               供 GitLab CI 的 artifacts:reports:dotenv 使用
+      build.env                               本次构建的版本与文件名，供 CI 后续步骤读取
 
     产物统一改成 ASCII 文件名：productName 是中文，而安装包名里带中文会在
     URL、CI 制品路径与各平台上带来不必要的编码麻烦。
@@ -151,9 +151,9 @@ $sums = foreach ($name in @($installerName, $portableName)) {
     (New-Object System.Text.UTF8Encoding($false))
 )
 
-# --- 供 CI 消费的 dotenv -------------------------------------------------
+# --- 供 CI 消费的构建信息 -------------------------------------------------
 $env_lines = @(
-    "PACKAGE_VERSION=$Version",
+    "APP_VERSION=$Version",
     "PRODUCT_SLUG=$Slug",
     "ARTIFACT_ARCH=$arch",
     "INSTALLER_FILE=$installerName",

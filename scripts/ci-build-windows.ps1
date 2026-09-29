@@ -1,30 +1,30 @@
 <#
 .SYNOPSIS
-    GitLab CI 在 Windows runner 上的构建入口：解析版本 -> 准备工具链 -> 编译 -> 打包。
+    CI 构建入口（Windows）：解析版本 -> 准备工具链 -> 编译 -> 打包。
 
 .DESCRIPTION
-    这个脚本是「一处编写、两处运行」的：CI 里直接调用，
-    本地也能用 `pwsh scripts/ci-build-windows.ps1` 完整复跑一遍流水线的构建阶段。
+    这个脚本是「一处编写、两处运行」的：GitHub Actions 里直接调用，
+    本地也能用 `powershell -File scripts/ci-build-windows.ps1` 完整复跑一遍构建阶段。
 
     版本来源优先级：
-      1. $env:CI_COMMIT_TAG（形如 v1.0.0）—— tag 流水线
+      1. $env:GITHUB_REF_TYPE = tag 时的 $env:GITHUB_REF_NAME（形如 v1.0.0）—— tag 流水线
       2. $env:BUILD_VERSION      —— 手动指定
       3. src-tauri/tauri.conf.json —— 普通分支构建
 
-    产出的 `artifacts/build.env` 会被 GitLab 的 artifact:reports:dotenv 收集，
-    供后续 release 作业读取（安装包名、免安装包名、包仓库版本号等）。
+    产出的 `artifacts/build.env` 记录了本次构建的版本与产物文件名，
+    发布作业通过它拿到要挂到 Release 上的文件。
 
 .PARAMETER SkipInstall
-    跳过 `pnpm install`（本地已装好依赖时复用，省时间）。
+    跳过 `pnpm install`（CI 中通常已单独安装过依赖）。
 
 .PARAMETER SkipToolchain
-    不尝试安装缺失的 Rust / Node（用于工具链已就绪的自建 runner，或只想做检查）。
+    不尝试安装缺失的 Rust / Node（CI 里由 setup 步骤负责，或自建机器已就绪）。
 
 .EXAMPLE
-    pwsh scripts/ci-build-windows.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1
 
 .EXAMPLE
-    pwsh scripts/ci-build-windows.ps1 -SkipInstall -SkipToolchain
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1 -SkipInstall -SkipToolchain
 #>
 [CmdletBinding()]
 param(
@@ -69,8 +69,9 @@ function Update-PathFromRegistry {
 # 1. 决定版本号
 # ---------------------------------------------------------------------------
 function Resolve-AppVersion {
-    if ($env:CI_COMMIT_TAG -and $env:CI_COMMIT_TAG -match '^v?\d+\.\d+\.\d+') {
-        return ($env:CI_COMMIT_TAG -replace '^[vV]', '')
+    # tag 流水线：版本号直接取自 tag
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v?\d+\.\d+\.\d+') {
+        return ($env:GITHUB_REF_NAME -replace '^[vV]', '')
     }
     if ($env:BUILD_VERSION) {
         return ($env:BUILD_VERSION -replace '^[vV]', '')
@@ -81,17 +82,10 @@ function Resolve-AppVersion {
 
 Write-Step '解析版本号'
 $appVersion = Resolve-AppVersion
-# 包仓库里的版本必须唯一（重复上传同名文件会被拒绝），
-# 因此非 tag 构建追加流水线号；安装包本身仍用干净的 semver。
-$packageVersion = $appVersion
-if (-not $env:CI_COMMIT_TAG -and $env:CI_PIPELINE_IID) {
-    $packageVersion = "$appVersion-latest.$($env:CI_PIPELINE_IID)"
-}
-Write-Host "应用版本   : $appVersion"
-Write-Host "包仓库版本 : $packageVersion"
-if ($env:CI_COMMIT_TAG) { Write-Host "触发来源   : tag $($env:CI_COMMIT_TAG)" }
-elseif ($env:CI_COMMIT_BRANCH) { Write-Host "触发来源   : branch $($env:CI_COMMIT_BRANCH)" }
-else { Write-Host '触发来源   : 本地运行' }
+Write-Host "应用版本 : $appVersion"
+if ($env:GITHUB_REF_TYPE -eq 'tag') { Write-Host "触发来源 : tag $($env:GITHUB_REF_NAME)" }
+elseif ($env:GITHUB_REF_NAME) { Write-Host "触发来源 : branch $($env:GITHUB_REF_NAME)" }
+else { Write-Host '触发来源 : 本地运行' }
 
 # ---------------------------------------------------------------------------
 # 2. 工具链
@@ -189,22 +183,19 @@ Write-Step '生成安装版与免安装版'
     -OutDir (Join-Path $RepoRoot 'artifacts') `
     -RepoRoot $RepoRoot
 
-# build.env 里的 PACKAGE_VERSION 需要按流水线唯一化，这里覆盖一次
+# 把本次构建的信息导出给同一作业的后续步骤（GitHub Actions 通过 $GITHUB_ENV 传递）
 $envFile = Join-Path $RepoRoot 'artifacts/build.env'
-$lines = Get-Content -LiteralPath $envFile | Where-Object { $_ -notmatch '^PACKAGE_VERSION=' }
-$lines = @("PACKAGE_VERSION=$packageVersion") + $lines
-[System.IO.File]::WriteAllLines($envFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-
-# 把变量写进 CI 作业环境，方便同作业后续步骤直接使用
-if ($env:GITLAB_CI) {
+if (Test-Path -LiteralPath $envFile) {
+    $lines = Get-Content -LiteralPath $envFile
     foreach ($line in $lines) {
         $pair = $line.Split('=', 2)
-        if ($pair.Count -eq 2) {
-            Set-Item -Path "Env:$($pair[0])" -Value $pair[1]
+        if ($pair.Count -ne 2) { continue }
+        Set-Item -Path "Env:$($pair[0])" -Value $pair[1]
+        if ($env:GITHUB_ENV) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
         }
     }
 }
 
 Write-Step '完成'
 Write-Host "应用版本：$appVersion"
-Write-Host "包仓库版本：$packageVersion"

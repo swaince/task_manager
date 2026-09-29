@@ -3,6 +3,9 @@
 一个用 **Tauri 2 + Vite + Vue 3 + TailwindCSS v4 + shadcn-vue** 构建的桌面应用，
 用来查看本机进程、它们占用的端口、启动参数与父子关系，并支持按名称 / 端口过滤和结束进程。
 
+[![Windows 构建与发布](https://github.com/swaince/task_manager/actions/workflows/release.yml/badge.svg)](https://github.com/swaince/task_manager/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/swaince/task_manager?label=release)](https://github.com/swaince/task_manager/releases)
+
 当前版本以 **Windows** 为目标平台，但后端从第一行代码起就按「可扩展到 macOS / Linux」来设计
 （详见 [跨平台扩展](#跨平台扩展)）。
 
@@ -97,11 +100,9 @@ task_manager/
 ├─ scripts/                      构建 / 发布脚本（CI 与本地共用同一套入口）
 │  ├─ set-version.ps1            把版本号同步写入三处清单
 │  ├─ package-windows.ps1        产出「安装版 + 免安装版」并写 build.env
-│  ├─ ci-build-windows.ps1       CI 构建入口：解析版本 → 工具链 → 编译 → 打包
-│  ├─ ci-publish-packages.ps1    上传到 GitLab 通用软件包仓库
-│  └─ ci-release.ps1             创建/更新 GitLab Release 并挂载资产链接
+│  └─ ci-build-windows.ps1       CI 构建入口：解析版本 → 工具链 → 编译 → 打包
 │
-├─ .gitlab-ci.yml                tag → vX.Y.Z；main → 滚动 latest
+├─ .github/workflows/release.yml GitHub Actions：tag → vX.Y.Z；main → 滚动 latest
 │
 └─ src-tauri/                    后端（Rust）
    └─ src/
@@ -182,18 +183,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/set-version.ps1 -Version v1.0.0
 ```
 
-CI 在 tag 流水线里会自动调用它，把 tag 去掉 `v` 后写进三处；普通分支构建则沿用仓库里的版本。
+tag 流水线会自动调用它，把 tag 去掉 `v` 后写进三处；普通分支构建则沿用仓库里的版本。
 
 ### 流水线行为
 
+工作流文件：`.github/workflows/release.yml`
+
 | 触发 | 行为 |
 | --- | --- |
-| 推送 tag `vX.Y.Z` | 构建 → 发布 release **`vX.Y.Z`**，产物版本号取自 tag |
-| 推送到默认分支 `main` | 构建 → 创建/更新滚动 release **`latest`** |
+| 推送 tag `vX.Y.Z` | 构建 → 发布 Release **`vX.Y.Z`**，产物版本号取自 tag |
+| 推送到默认分支 `main` | 构建 → 创建/更新滚动 Release **`latest`**（`latest` tag 一并移到最新提交） |
+| Pull Request | 只跑类型检查、单测与构建，不发布 |
+| 手动触发（workflow_dispatch） | 可指定版本号，行为同 main |
 
-流水线只在 Windows runner 上跑（Tauri 的 Windows 打包必须在 Windows 上完成）；
-两个作业（构建、发布）都用 `powershell -File scripts/...` 调用仓库里的脚本，
-所以**本地可以用完全相同的命令复跑**：
+滚动 Release 以 `--latest=false` 创建，所以**不会抢走版本 tag 在仓库首页的 Latest 标记** ——
+`latest` 只是一个固定书签（`/releases/tag/latest`），始终指向 main 的最新产物。
+
+Tauri 的 Windows 打包必须在 Windows 上完成，因此构建跑在 `windows-latest`；
+发布作业跑在 `ubuntu-latest`，用预装的 `gh` CLI 建 Release。
+构建逻辑全在 `scripts/*.ps1` 里，CI 只是编排，所以**本地可以用同样的命令复跑**：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1
@@ -201,41 +209,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci-build-windows.ps1
 
 ### 交付物
 
-每次构建产出两件，文件名统一为 ASCII（`productName` 是中文，直接进文件名会在
-URL、CI 制品路径上带来编码麻烦，所以打包时统一改名）：
+每次构建产出两件，文件名统一为 ASCII（`productName` 是中文，直接进文件名会在 URL、
+制品路径与 Release 资源名上带来编码麻烦，所以打包时统一改名）：
 
 | 文件 | 类型 | 说明 |
 | --- | --- | --- |
 | `ProcessManager_<版本>_x64-setup.exe` | 安装版 | NSIS 安装程序，可选「仅当前用户 / 所有用户」，带开始菜单快捷方式与卸载项 |
 | `ProcessManager_<版本>_x64_portable.zip` | 免安装版 | 解压即用，不写注册表、不留卸载项，删除目录即完成卸载；内含 `使用说明.txt` |
 
-外加 `SHA256SUMS.txt`。产物同时进入两个地方：
-
-1. **作业制品**（默认 1 个月过期，仅用于同一条流水线内传递）；
-2. **GitLab 通用软件包仓库**（持久），release 上的下载链接指向这里，
-   地址形如 `$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/process-manager/<版本>/<文件>`。
+外加 `SHA256SUMS.txt`（内容也会写进 Release 说明）。两件产物既作为工作流制品保留 30 天，
+也**直接挂到 Release 上** —— 公开仓库无需登录即可下载。
 
 > 免安装版就是 `tauri build` 直接产出的那个单文件 exe（前端资源已内嵌），
 > 打包脚本只是把它改名、配上说明并压缩。
->
-> 注意：**私有项目**的通用软件包仓库下载需要登录 —— release 上的链接会要求认证。
-> 想让链接对外匿名可用，需要把项目设为公开，或把产物放到别处（对象存储 / 静态站点）后
-> 修改 `scripts/ci-release.ps1` 里 `assets.links` 的地址。
 
-### Runner 与变量
+### 缓存与耗时
 
-只需要一个 **Windows runner**。默认使用 GitLab.com 托管 runner
-（`saas-windows-medium-amd64`，需要 Premium/Ultimate）；自建 runner 覆盖变量
-`WINDOWS_RUNNER_TAG` 即可。runner 上没有 Rust / Node 时，构建脚本会先尝试安装
-（rustup + Chocolatey 或官方 zip 兜底），关掉用 `SKIP_TOOLCHAIN=true`。
+| 环节 | 手段 |
+| --- | --- |
+| pnpm store | `actions/setup-node` 的 `cache: pnpm` |
+| Rust 依赖与 `target/` | `Swatinem/rust-cache`（key `windows-x64`） |
 
-| 变量 | 必填 | 说明 |
-| --- | --- | --- |
-| `WINDOWS_RUNNER_TAG` | 否 | Windows runner 的 tag，默认 `saas-windows-medium-amd64` |
-| `SKIP_TOOLCHAIN` | 否 | `true` = 不自动安装缺失的 Rust / Node |
-| `BUILD_VERSION` | 否 | 手动指定版本号，优先级低于 tag |
-| `RELEASE_TOKEN` | 否 | **masked** 的项目访问令牌（`write_repository`）。提供后，main 的滚动 tag `latest` 会被移动到最新提交；不提供则只更新 release 内容，tag 停在首次创建的位置 |
+实测：本地 release 编译 6m46s；冷缓存整条流水线约 8～10 分钟，热缓存后 3～5 分钟。
 
+### 可调项
+
+| 位置 | 说明 |
+| --- | --- |
+| 工作流的 `BUILD_VERSION` 输入 | 手动指定版本号，优先级低于 tag |
+| `scripts/package-windows.ps1 -Slug` | 交付文件名前缀，默认 `ProcessManager` |
+| `src-tauri/tauri.conf.json` 的 `bundle.targets` | 想额外产出 MSI 就改成 `["nsis", "msi"]` |
+| `scripts/ci-build-windows.ps1 -SkipToolchain` | 自建机器上工具链已就绪时跳过检测 / 安装 |
+
+> 本仓库早期用的是 GitLab CI（`.gitlab-ci.yml` 与另外两个 `ci-*.ps1`），
+> 现已按 GitHub Actions 重做；旧实现仍可从 git 历史（提交 `2f6e0e5`）取回。
 ---
 
 ## 关键实现说明

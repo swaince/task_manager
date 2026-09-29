@@ -1,0 +1,200 @@
+# =============================================================================
+# Windows 构建与发布
+#
+# 流水线行为
+#   * 推送到 main（或手动触发）→ 构建 → 创建/更新滚动 Release `latest`
+#   * 推送 tag（vX.Y.Z）      → 构建 → 发布 Release vX.Y.Z，产物版本号取自 tag
+#   * Pull Request            → 只跑检查与构建，不发布
+#
+# 交付物（两件）
+#   ProcessManager_<版本>_x64-setup.exe        安装版（NSIS）
+#   ProcessManager_<版本>_x64_portable.zip     免安装版（解压即用）
+#
+# 说明
+#   * Tauri 的 Windows 打包必须在 Windows 上完成，因此构建跑在 windows-latest。
+#   * 构建逻辑都在 scripts/*.ps1 里，本地可以用同样的命令复跑，CI 只是编排。
+#   * main 的 `latest` 是一个"滚动 Release"：每次都会把 `latest` tag 移动到最新提交，
+#     并重建 Release 与资产；它不会抢走版本 tag 的 Latest 标记（--latest=false）。
+# =============================================================================
+
+name: Windows 构建与发布
+
+on:
+  push:
+    branches: [main]
+    # 只有 vX.Y.Z 形式的 tag 才触发发布；`latest` 滚动 tag 不会匹配到这里
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动指定版本号（留空则使用 src-tauri/tauri.conf.json 中的版本）'
+        required: false
+        type: string
+
+# 同一个分支的旧流水线自动让位；但 tag 流水线不取消（每次都代表一次发布）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建（安装版 + 免安装版）
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-x64
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查与单测
+        run: |
+          pnpm typecheck
+          pnpm test
+
+      - name: 后端单元测试
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      # 版本号、编译、打包（安装版 + 免安装版 + 校验和）都在这个脚本里。
+      # 依赖与工具链上面已经准备好，所以跳过这两步。
+      - name: 编译并生成交付物
+        shell: pwsh
+        run: ./scripts/ci-build-windows.ps1 -SkipInstall -SkipToolchain
+        env:
+          BUILD_VERSION: ${{ github.event.inputs.version }}
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            artifacts/*.exe
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+            artifacts/build.env
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-packages
+          path: artifacts
+
+      - name: 生成发布说明
+        run: |
+          set -euo pipefail
+          INSTALLER=$(basename "$(ls artifacts/*-setup.exe | head -n 1)")
+          PORTABLE=$(basename "$(ls artifacts/*_portable.zip | head -n 1)")
+          VERSION=$(grep '^APP_VERSION=' artifacts/build.env | cut -d= -f2)
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            HEADLINE="版本 ${GITHUB_REF_NAME}"
+          else
+            HEADLINE="滚动构建（main @ ${GITHUB_SHA:0:8}）"
+          fi
+
+          cat > release-notes.md <<EOF
+          ## Windows 构建 · ${HEADLINE}
+
+          | 项目 | 值 |
+          | --- | --- |
+          | 应用版本 | \`${VERSION}\` |
+          | 提交 | \`${GITHUB_SHA:0:8}\` |
+          | 分支 / 标签 | \`${GITHUB_REF_NAME}\` |
+
+          ### 下载
+
+          | 版本 | 文件 | 说明 |
+          | --- | --- | --- |
+          | **安装版** | \`${INSTALLER}\` | 双击安装，写入开始菜单与卸载项，安装时可选用当前用户还是所有用户 |
+          | **免安装版** | \`${PORTABLE}\` | 解压即用，不写注册表，删除目录即完成卸载 |
+
+          > **运行要求**：Windows 10 1809+ / Windows 11，需要 WebView2 运行时（较新系统已内置）。
+          > **建议以管理员身份运行** —— 普通权限下受保护进程的命令行、环境变量读不到，也无法结束。
+
+          ### 校验和
+
+          \`\`\`
+          $(cat artifacts/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          echo "--- 生成的发布说明 ---"
+          cat release-notes.md
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            TITLE="${GITHUB_REF_NAME}"
+            LATEST_FLAG=""
+          else
+            TAG="latest"
+            TITLE="Latest（main 滚动构建）"
+            # 不要让滚动 release 顶掉版本 tag 在仓库首页的 Latest 标记
+            LATEST_FLAG="--latest=false"
+
+            # 把 latest tag 移到当前提交。GITHUB_TOKEN 推送的引用不会再触发流水线，
+            # 所以不会出现自我循环；tags 过滤也只匹配 vX.Y.Z，双保险。
+            echo "移动 latest tag 到 ${GITHUB_SHA}"
+            git tag -f latest "${GITHUB_SHA}"
+            git push -f origin refs/tags/latest
+          fi
+
+          # 先删掉同名旧 Release（tag 保留），让"创建"这条路永远走得通
+          gh release delete "${TAG}" --yes || true
+
+          gh release create "${TAG}" \
+            --title "${TITLE}" \
+            --notes-file release-notes.md \
+            --target "${GITHUB_SHA}" \
+            ${LATEST_FLAG} \
+            artifacts/*.exe artifacts/*.zip artifacts/SHA256SUMS.txt
+
+          echo "Release 地址：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
