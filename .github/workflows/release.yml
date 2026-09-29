@@ -127,7 +127,8 @@ jobs:
           set -euo pipefail
           INSTALLER=$(basename "$(ls artifacts/*-setup.exe | head -n 1)")
           PORTABLE=$(basename "$(ls artifacts/*_portable.zip | head -n 1)")
-          VERSION=$(grep '^APP_VERSION=' artifacts/build.env | cut -d= -f2)
+          # 去掉可能的 \r：build.env 由 Windows 侧生成，多一道保险
+          VERSION=$(grep '^APP_VERSION=' artifacts/build.env | cut -d= -f2 | tr -d '\r')
 
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             HEADLINE="版本 ${GITHUB_REF_NAME}"

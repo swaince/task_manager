@@ -192,7 +192,8 @@ if (Test-Path -LiteralPath $envFile) {
         if ($pair.Count -ne 2) { continue }
         Set-Item -Path "Env:$($pair[0])" -Value $pair[1]
         if ($env:GITHUB_ENV) {
-            Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
+            # 用 LF 追加；Add-Content 在 Windows 上会写 CRLF，GitHub 解析出来的值会带 \r
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, "$line`n", (New-Object System.Text.UTF8Encoding($false)))
         }
     }
 }

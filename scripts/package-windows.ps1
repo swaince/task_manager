@@ -160,9 +160,11 @@ $env_lines = @(
     "PORTABLE_FILE=$portableName",
     "CHECKSUMS_FILE=SHA256SUMS.txt"
 )
-[System.IO.File]::WriteAllLines(
+# 刻意用 LF 而不是 WriteAllLines 的 CRLF：这个文件会被 Linux 侧的发布作业用
+# grep/cut 解析，CRLF 会让取到的值尾随一个 \r（Release 说明里就会出现多余的字符）。
+[System.IO.File]::WriteAllText(
     (Join-Path $OutDir 'build.env'),
-    $env_lines,
+    (($env_lines -join "`n") + "`n"),
     (New-Object System.Text.UTF8Encoding($false))
 )
 
